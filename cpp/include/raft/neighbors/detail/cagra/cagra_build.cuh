@@ -43,6 +43,65 @@
 
 namespace raft::neighbors::cagra::detail {
 
+template <typename IdxT>
+void write_to_graph(raft::host_matrix_view<IdxT, int64_t, row_major> knn_graph,
+                    raft::host_matrix_view<int64_t, int64_t, row_major> neighbors_host_view,
+                    size_t& num_self_included,
+                    size_t batch_size,
+                    size_t batch_offset)
+{
+  uint32_t node_degree = knn_graph.extent(1);
+  size_t top_k         = neighbors_host_view.extent(1);
+  // omit itself & write out
+  for (std::size_t i = 0; i < batch_size; i++) {
+    size_t vec_idx = i + batch_offset;
+    for (std::size_t j = 0, num_added = 0; j < top_k && num_added < node_degree; j++) {
+      const auto v = neighbors_host_view(i, j);
+      if (static_cast<size_t>(v) == vec_idx) {
+        num_self_included++;
+        continue;
+      }
+      knn_graph(vec_idx, num_added) = v;
+      num_added++;
+    }
+  }
+}
+
+template <typename DataT, typename IdxT, typename accessor>
+void refine_host(raft::host_matrix<DataT, int64_t>& queries_host,
+                 raft::host_matrix<int64_t, int64_t>& neighbors_host,
+                 raft::host_matrix<int64_t, int64_t>& refined_neighbors_host,
+                 raft::host_matrix<float, int64_t>& refined_distances_host,
+                 mdspan<const DataT, matrix_extent<int64_t>, row_major, accessor> dataset,
+                 raft::host_matrix_view<IdxT, int64_t, row_major> knn_graph,
+                 ivf_pq::index_params& build_params,
+                 size_t& num_self_included,
+                 size_t batch_size,
+                 size_t batch_offset,
+                 int top_k)
+{
+  if constexpr (is_host_mdspan_v<decltype(dataset)>) {
+    auto queries_host_view = make_host_matrix_view<const DataT, int64_t>(
+      queries_host.data_handle(), batch_size, dataset.extent(1));
+    auto neighbors_host_view = make_host_matrix_view<const int64_t, int64_t>(
+      neighbors_host.data_handle(), batch_size, neighbors_host.extent(1));
+    auto refined_neighbors_host_view = make_host_matrix_view<int64_t, int64_t>(
+      refined_neighbors_host.data_handle(), batch_size, top_k);
+    auto refined_distances_host_view = make_host_matrix_view<float, int64_t>(
+      refined_distances_host.data_handle(), batch_size, top_k);
+    raft::neighbors::detail::refine_host<int64_t, DataT, float, int64_t>(
+      dataset,
+      queries_host_view,
+      neighbors_host_view,
+      refined_neighbors_host_view,
+      refined_distances_host_view,
+      build_params.metric);
+
+    write_to_graph(
+      knn_graph, refined_neighbors_host_view, num_self_included, batch_size, batch_offset);
+  }
+}
+
 template <typename DataT, typename IdxT, typename accessor>
 void build_knn_graph(raft::resources const& res,
                      mdspan<const DataT, matrix_extent<int64_t>, row_major, accessor> dataset,
@@ -133,6 +192,12 @@ void build_knn_graph(raft::resources const& res,
   size_t next_report_offset = 0;
   size_t d_report_offset    = dataset.extent(0) / 100;  // Report progress in 1% steps.
 
+  bool host_refinement   = is_host_mdspan_v<decltype(dataset)> && top_k != gpu_top_k;
+  bool device_refinement = !is_host_mdspan_v<decltype(dataset)> && top_k != gpu_top_k;
+
+  size_t last_batch_size   = 0;
+  size_t last_batch_offset = 0;
+
   for (const auto& batch : vec_batches) {
     // Map int64_t to uint32_t because ivf_pq requires the latter.
     // TODO(tfeher): remove this mapping once ivf_pq accepts mdspan with int64_t index type
@@ -144,7 +209,24 @@ void build_knn_graph(raft::resources const& res,
       distances.data_handle(), batch.size(), distances.extent(1));
 
     ivf_pq::search(res, *search_params, index, queries_view, neighbors_view, distances_view);
-    if constexpr (is_host_mdspan_v<decltype(dataset)>) {
+
+    if (host_refinement) {
+      // process previous batch async on host
+      if (last_batch_size > 0) {
+        refine_host(queries_host,
+                    neighbors_host,
+                    refined_neighbors_host,
+                    refined_distances_host,
+                    dataset,
+                    knn_graph,
+                    *build_params,
+                    num_self_included,
+                    last_batch_size,
+                    last_batch_offset,
+                    top_k);
+      }
+
+      // copy next batch to host
       raft::copy(neighbors_host.data_handle(),
                  neighbors.data_handle(),
                  neighbors_view.size(),
@@ -153,24 +235,28 @@ void build_knn_graph(raft::resources const& res,
                  batch.data(),
                  queries_view.size(),
                  resource::get_cuda_stream(res));
-      auto queries_host_view = make_host_matrix_view<const DataT, int64_t>(
-        queries_host.data_handle(), batch.size(), batch.row_width());
-      auto neighbors_host_view = make_host_matrix_view<const int64_t, int64_t>(
-        neighbors_host.data_handle(), batch.size(), neighbors.extent(1));
-      auto refined_neighbors_host_view = make_host_matrix_view<int64_t, int64_t>(
-        refined_neighbors_host.data_handle(), batch.size(), top_k);
-      auto refined_distances_host_view = make_host_matrix_view<float, int64_t>(
-        refined_distances_host.data_handle(), batch.size(), top_k);
+
+      last_batch_size   = batch.size();
+      last_batch_offset = batch.offset();
+
+      // we need to ensure the copy operations are done prior using the host data
       resource::sync_stream(res);
 
-      raft::neighbors::detail::refine_host<int64_t, DataT, float, int64_t>(
-        dataset,
-        queries_host_view,
-        neighbors_host_view,
-        refined_neighbors_host_view,
-        refined_distances_host_view,
-        build_params->metric);
-    } else {
+      // process refinement for last batch
+      if (last_batch_offset + last_batch_size == (size_t)num_queries) {
+        refine_host(queries_host,
+                    neighbors_host,
+                    refined_neighbors_host,
+                    refined_distances_host,
+                    dataset,
+                    knn_graph,
+                    *build_params,
+                    num_self_included,
+                    last_batch_size,
+                    last_batch_offset,
+                    top_k);
+      }
+    } else if (device_refinement) {
       auto neighbor_candidates_view = make_device_matrix_view<const int64_t, uint64_t>(
         neighbors.data_handle(), batch.size(), gpu_top_k);
       auto refined_neighbors_view = make_device_matrix_view<int64_t, int64_t>(
@@ -193,20 +279,22 @@ void build_knn_graph(raft::resources const& res,
                  refined_neighbors_view.size(),
                  resource::get_cuda_stream(res));
       resource::sync_stream(res);
-    }
-    // omit itself & write out
-    // TODO(tfeher): do this in parallel with GPU processing of next batch
-    for (std::size_t i = 0; i < batch.size(); i++) {
-      size_t vec_idx = i + batch.offset();
-      for (std::size_t j = 0, num_added = 0; j < top_k && num_added < node_degree; j++) {
-        const auto v = refined_neighbors_host(i, j);
-        if (static_cast<size_t>(v) == vec_idx) {
-          num_self_included++;
-          continue;
-        }
-        knn_graph(vec_idx, num_added) = v;
-        num_added++;
-      }
+
+      auto refined_neighbors_host_view = make_host_matrix_view<int64_t, int64_t>(
+        refined_neighbors_host.data_handle(), batch.size(), top_k);
+      write_to_graph(
+        knn_graph, refined_neighbors_host_view, num_self_included, batch.size(), batch.offset());
+    } else {
+      // top_k == gpu_top_k --> can we fill knn_graph from neighbors directly
+      raft::copy(neighbors_host.data_handle(),
+                 neighbors.data_handle(),
+                 neighbors_view.size(),
+                 resource::get_cuda_stream(res));
+      resource::sync_stream(res);
+      auto refined_neighbors_host_view = make_host_matrix_view<int64_t, int64_t>(
+        refined_neighbors_host.data_handle(), batch.size(), top_k);
+      write_to_graph(
+        knn_graph, refined_neighbors_host_view, num_self_included, batch.size(), batch.offset());
     }
 
     size_t num_queries_done = batch.offset() + batch.size();
