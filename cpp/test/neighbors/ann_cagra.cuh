@@ -218,6 +218,7 @@ struct AnnCagraInputs {
   bool include_serialized_dataset;
   // std::optional<double>
   double min_recall;  // = std::nullopt;
+  std::optional<float> ivf_pq_search_refine_ratio = std::nullopt;
 };
 
 inline ::std::ostream& operator<<(::std::ostream& os, const AnnCagraInputs& p)
@@ -228,7 +229,11 @@ inline ::std::ostream& operator<<(::std::ostream& os, const AnnCagraInputs& p)
      << ", k=" << p.k << ", " << algo.at((int)p.algo) << ", max_queries=" << p.max_queries
      << ", itopk_size=" << p.itopk_size << ", search_width=" << p.search_width
      << ", metric=" << static_cast<int>(p.metric) << (p.host_dataset ? ", host" : ", device")
-     << ", build_algo=" << build_algo.at((int)p.build_algo) << '}' << std::endl;
+     << ", build_algo=" << build_algo.at((int)p.build_algo);
+  if ((int)p.build_algo == 0 && p.ivf_pq_search_refine_ratio) {
+    os << "(refine_rate=" << *p.ivf_pq_search_refine_ratio << ')';
+  }
+  os << '}' << std::endl;
   return os;
 }
 
@@ -300,9 +305,14 @@ class AnnCagraTest : public ::testing::TestWithParam<AnnCagraInputs> {
             raft::copy(database_host.data_handle(), database.data(), database.size(), stream_);
             auto database_host_view = raft::make_host_matrix_view<const DataT, int64_t>(
               (const DataT*)database_host.data_handle(), ps.n_rows, ps.dim);
-            index = cagra::build<DataT, IdxT>(handle_, index_params, database_host_view);
+            index = cagra::detail::build<DataT, IdxT>(handle_,
+                                                      index_params,
+                                                      database_host_view,
+                                                      std::nullopt,
+                                                      ps.ivf_pq_search_refine_ratio);
           } else {
-            index = cagra::build<DataT, IdxT>(handle_, index_params, database_view);
+            index = cagra::detail::build<DataT, IdxT>(
+              handle_, index_params, database_view, std::nullopt, ps.ivf_pq_search_refine_ratio);
           };
           cagra::serialize(handle_, "cagra_index", index, ps.include_serialized_dataset);
         }
@@ -554,9 +564,11 @@ class AnnCagraFilterTest : public ::testing::TestWithParam<AnnCagraInputs> {
           raft::copy(database_host.data_handle(), database.data(), database.size(), stream_);
           auto database_host_view = raft::make_host_matrix_view<const DataT, int64_t>(
             (const DataT*)database_host.data_handle(), ps.n_rows, ps.dim);
-          index = cagra::build<DataT, IdxT>(handle_, index_params, database_host_view);
+          index = cagra::detail::build<DataT, IdxT>(
+            handle_, index_params, database_host_view, std::nullopt, ps.ivf_pq_search_refine_ratio);
         } else {
-          index = cagra::build<DataT, IdxT>(handle_, index_params, database_view);
+          index = cagra::detail::build<DataT, IdxT>(
+            handle_, index_params, database_view, std::nullopt, ps.ivf_pq_search_refine_ratio);
         }
 
         if (!ps.include_serialized_dataset) { index.update_dataset(handle_, database_view); }
@@ -679,9 +691,11 @@ class AnnCagraFilterTest : public ::testing::TestWithParam<AnnCagraInputs> {
           raft::copy(database_host.data_handle(), database.data(), database.size(), stream_);
           auto database_host_view = raft::make_host_matrix_view<const DataT, int64_t>(
             (const DataT*)database_host.data_handle(), ps.n_rows, ps.dim);
-          index = cagra::build<DataT, IdxT>(handle_, index_params, database_host_view);
+          index = cagra::detail::build<DataT, IdxT>(
+            handle_, index_params, database_host_view, std::nullopt, ps.ivf_pq_search_refine_ratio);
         } else {
-          index = cagra::build<DataT, IdxT>(handle_, index_params, database_view);
+          index = cagra::detail::build<DataT, IdxT>(
+            handle_, index_params, database_view, std::nullopt, ps.ivf_pq_search_refine_ratio);
         }
 
         if (!ps.include_serialized_dataset) { index.update_dataset(handle_, database_view); }
@@ -892,6 +906,24 @@ inline std::vector<AnnCagraInputs> generate_inputs()
     {false},
     {false},
     {0.995});
+  inputs.insert(inputs.end(), inputs2.begin(), inputs2.end());
+
+  inputs2 =
+    raft::util::itertools::product<AnnCagraInputs>({100},
+                                                   {10000},
+                                                   {32},
+                                                   {10},
+                                                   {graph_build_algo::IVF_PQ},
+                                                   {search_algo::AUTO},
+                                                   {10},
+                                                   {0},  // team_size
+                                                   {64},
+                                                   {1},
+                                                   {raft::distance::DistanceType::L2Expanded},
+                                                   {false, true},
+                                                   {false},
+                                                   {0.995},
+                                                   {1.0, 2.0, 3.0});
   inputs.insert(inputs.end(), inputs2.begin(), inputs2.end());
 
   return inputs;
